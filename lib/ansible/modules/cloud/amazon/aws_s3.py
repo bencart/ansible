@@ -435,13 +435,13 @@ def paginated_list(s3, **pagination_params):
         yield [data['Key'] for data in page.get('Contents', [])]
 
 
-def paginated_versions(s3, **pagination_params):
-    pg = s3.get_paginator('list_object_versions')
+def paginated_versions_list(s3_client, **pagination_params):
+    pg = s3_client.get_paginator('list_object_versions')
     for page in pg.paginate(**pagination_params):
-        pvout = []
-        yield map(lambda v: { 'VersionId': v['VersionId'], 'Key': v['Key'] }, page.get('Versions', []) + page.get('DeleteMarkers', []))
+        # We have to merge the Versions and DeleteMarker lists here, as DeleteMarkers can still prevent a bucket deletion
+        yield [(data['Key'], data['VersionId']) for data in (page.get('Versions', []) + page.get('DeleteMarkers', []))]
 
-
+        
 def list_keys(module, s3, bucket, prefix, marker, max_keys):
     pagination_params = {'Bucket': bucket}
     for param_name, param_value in (('Prefix', prefix), ('StartAfter', marker), ('MaxKeys', max_keys)):
@@ -461,9 +461,7 @@ def delete_bucket(module, s3, bucket):
         if exists is False:
             return False
         # if there are contents then we need to delete all versions of all objects before we can delete the bucket
-        for keys in paginated_versions(s3, Bucket=bucket):
-            if keys:
-                s3.delete_objects(Bucket=bucket, Delete={'Objects': keys})
+        empty_bucket(module, s3, bucket)
         s3.delete_bucket(Bucket=bucket)
         return True
     except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
@@ -478,12 +476,20 @@ def empty_bucket(module, s3, bucket):
         if exists is False:
             return False
         # if there are contents then we delete all versions
-        for keys in paginated_versions(s3, Bucket=bucket):
-            if keys:
-                s3.delete_objects(Bucket=bucket, Delete={'Objects': keys})
+        for key_version_pairs in paginated_versions_list(s3, Bucket=bucket):
+            formatted_keys = [{'Key': key, 'VersionId': version} for key, version in key_version_pairs]
+            for fk in formatted_keys:
+                # remove VersionId from cases where they are `None` so that
+                # unversioned objects are deleted using `DeleteObject`
+                # rather than `DeleteObjectVersion`, improving backwards
+                # compatibility with older IAM policies.
+                if not fk.get('VersionId'):
+                    fk.pop('VersionId')
+            if formatted_keys:
+                s3.delete_objects(Bucket=bucket, Delete={'Objects': formatted_keys})
         return True
     except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
-        module.fail_json_aws(e, msg="Failed while deleting bucket %s." % bucket)
+        module.fail_json_aws(e, msg="Failed while emptying bucket %s." % bucket)
 
 
 def delete_key(module, s3, bucket, obj):
