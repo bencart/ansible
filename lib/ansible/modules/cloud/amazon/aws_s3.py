@@ -85,10 +85,10 @@ options:
   mode:
     description:
       - Switches the module behaviour between put (upload), get (download), geturl (return download url, Ansible 1.3+),
-        getstr (download object as string (1.3+)), list (list keys, Ansible 2.0+), create (bucket), delete (bucket),
+        getstr (download object as string (1.3+)), list (list keys, Ansible 2.0+), create (bucket), delete (bucket), empty(bucket, Ansible 2.8+)
         and delobj (delete object, Ansible 2.0+).
     required: true
-    choices: ['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list']
+    choices: ['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list', 'empty']
   object:
     description:
       - Keyname of the object inside the bucket. Can be used to create "virtual directories", see examples.
@@ -250,6 +250,11 @@ EXAMPLES = '''
   aws_s3:
     bucket: mybucket
     mode: delete
+    
+- name: Empty a bucket of all versions of all objects
+  aws_s3:
+    bucket: mybucket
+    mode: empty
 
 - name: GET an object but don't download if the file checksums match. New in 2.0
   aws_s3:
@@ -430,6 +435,13 @@ def paginated_list(s3, **pagination_params):
         yield [data['Key'] for data in page.get('Contents', [])]
 
 
+def paginated_versions(s3, **pagination_params):
+    pg = s3.get_paginator('list_object_versions')
+    for page in pg.paginate(**pagination_params):
+        pvout = []
+        yield map(lambda v: { 'VersionId': v['VersionId'], 'Key': v['Key'] }, page.get('Versions', []) + page.get('DeleteMarkers', []))
+
+
 def list_keys(module, s3, bucket, prefix, marker, max_keys):
     pagination_params = {'Bucket': bucket}
     for param_name, param_value in (('Prefix', prefix), ('StartAfter', marker), ('MaxKeys', max_keys)):
@@ -448,12 +460,27 @@ def delete_bucket(module, s3, bucket):
         exists = bucket_check(module, s3, bucket)
         if exists is False:
             return False
-        # if there are contents then we need to delete them before we can delete the bucket
-        for keys in paginated_list(s3, Bucket=bucket):
-            formatted_keys = [{'Key': key} for key in keys]
-            if formatted_keys:
-                s3.delete_objects(Bucket=bucket, Delete={'Objects': formatted_keys})
+        # if there are contents then we need to delete all versions of all objects before we can delete the bucket
+        for keys in paginated_versions(s3, Bucket=bucket):
+            if keys:
+                s3.delete_objects(Bucket=bucket, Delete={'Objects': keys})
         s3.delete_bucket(Bucket=bucket)
+        return True
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
+        module.fail_json_aws(e, msg="Failed while deleting bucket %s." % bucket)
+
+
+def empty_bucket(module, s3, bucket):
+    if module.check_mode:
+        module.exit_json(msg="EMPTY operation skipped - running in check mode", changed=True)
+    try:
+        exists = bucket_check(module, s3, bucket)
+        if exists is False:
+            return False
+        # if there are contents then we delete all versions
+        for keys in paginated_versions(s3, Bucket=bucket):
+            if keys:
+                s3.delete_objects(Bucket=bucket, Delete={'Objects': keys})
         return True
     except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
         module.fail_json_aws(e, msg="Failed while deleting bucket %s." % bucket)
@@ -682,7 +709,7 @@ def main():
             marker=dict(default=""),
             max_keys=dict(default=1000, type='int'),
             metadata=dict(type='dict'),
-            mode=dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list'], required=True),
+            mode=dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list', 'empty'], required=True),
             object=dict(),
             permission=dict(type='list', default=['private']),
             version=dict(default=None),
@@ -900,6 +927,15 @@ def main():
             deletertn = delete_bucket(module, s3, bucket)
             if deletertn is True:
                 module.exit_json(msg="Bucket %s and all keys have been deleted." % bucket, changed=True)
+        else:
+            module.fail_json(msg="Bucket parameter is required.")
+
+    # Delete all objects in a bucket
+    if mode == 'empty':
+        if bucket:
+            emptyrtn = empty_bucket(module, s3, bucket)
+            if emptyrtn is True:
+                module.exit_json(msg="Bucket %s has been emptied." % bucket, changed=True)
         else:
             module.fail_json(msg="Bucket parameter is required.")
 
